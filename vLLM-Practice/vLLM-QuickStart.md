@@ -125,7 +125,8 @@ class LLMEngine:
     def _init_cache():
         # Profiles the memory usage and initializes the KV cache.
         # Get the maximum number of blocks that can be allocated on GPU and CPU.
-        # 运行一次输入负载最大（输入长度为模型最大上下文长度）的模型的前向传播（开启topk、topp），计算剩余内存、显存（可存放kvcache）可划分块数
+        # Run a forward inference with prompt lenth equal to the max_model_len (the longest inserted prompt is supported by the model), and get the peak memory.
+        # Then, use peak memory to calculate how many blocks can be allocated on GPU and CPU.
         num_blocks = Worker.profile_num_available_blocks(
             block_size,
             gpu_memory_utilization,
@@ -227,7 +228,7 @@ class LLM:
             token_ids = None if prompt_token_ids is None else prompt_token_ids[
                 i]
             self._add_request(prompt, sampling_params, token_ids)
-        # 执行 engine
+        # call engine
         return self._run_engine(use_tqdm)
 
     def _add_requests():
@@ -237,15 +238,15 @@ class LLM:
                                     prompt_token_ids)
     
     def _run_engine():
-        # 核心逻辑
+        # main function
         outputs: List[RequestOutput] = []
-        # 调用engine，查看当时是否还有未完成的requests
+        # call the engine class，to get the unfinished requests.
         # len(self.waiting) + len(self.running) + len(self.swapped)
         while self.llm_engine.has_unfinished_requests():
             # step 执行一个decoder iteration
             step_outputs = self.llm_engine.step()
             for output in step_outputs:
-                # 判断哪些结束了
+                # return the output if finished
                 if output.finished:
                     outputs.append(output)
 
@@ -271,7 +272,7 @@ class LLMEngine:
         # Add the sequence group to the scheduler.
         self.scheduler.add_seq_group(seq_group)
 
-    # 执行一个forward iteration, 得到一个token
+    # run a forward iteration, and let the model generate one token
     # prefilling or token-generation
     def step(self) -> List[RequestOutput]:
         """
@@ -282,7 +283,7 @@ class LLMEngine:
         if scheduler_outputs.is_empty():
             return ignored
 
-        # Execute the model. - 执行一次forward, 获取结果
+        # Execute the model. - forward
         output = self._run_workers(
             "execute_model",
             seq_group_metadata_list=seq_group_metadata_list,
@@ -290,7 +291,7 @@ class LLMEngine:
             blocks_to_swap_out=scheduler_outputs.blocks_to_swap_out,
             blocks_to_copy=scheduler_outputs.blocks_to_copy,
         )
-        # 更新Sequence信息
+        # update the sequence information
         return self._process_model_outputs(output, scheduler_outputs)
     
     def _run_workers(self, method: str, *args, ...):
@@ -300,16 +301,17 @@ class LLMEngine:
         # run all workers
         for workers in work_groups:
             all_outputs.extend(
-                # 注意，这里的workers还是一个List
+                # Notice: Here the workers is a List
                 self._run_workers_in_batch(workers, method, *args, **kwargs))
-                # 此方法 为每个worker执行method方法
+                # _run_workers_in_batch will call `method` function for each worker
                 """
-                # getattr 从worker中获取 method 方法：
+                # getattr get valid `method` function from worker：
+                # the two main function is:
                 #   load_model
-                #   execute_model  # 执行inference
+                #   execute_model  # do LLM inference
                 executor = getattr(worker, method)
 
-                # execute - 实际调用的是 Worker.execute_model 方法
+                # execute - actually will call the Worker.execute_model function
                 output = executor(*args, **kwargs)
                 """
 ```
@@ -327,7 +329,7 @@ class Worker:
     ) -> SamplerOutput:
         # Issue cache operations： Swap_in, Swap_out, Copy
 
-        # execute
+        # call the forward function for each model.
         output = self.model_runner.execute_model(seq_group_metadata_list, self.gpu_cache, cache_events)
         return output
 ```
@@ -355,7 +357,7 @@ class ModelRunner:
             cache_events=cache_events,
         )
 
-        # Sample the next token. 使用抽样逻辑
+        # Sample the next token. 
         output = self.model.sample(
             hidden_states=hidden_states,
             sampling_metadata=sampling_metadata,
@@ -679,8 +681,53 @@ class Scheduler:
 # in vllm/core/scheduler.py   _schedule function
 # while the free block number in GPU device is not enough for a seq_group (a request), will try to swap out all the blocks in these seq_group
 
-# for partition 2, how to swap_in and how to swap_out
-# in vllm/core/block_manager.py
+# for partition 2, when _schedule judge which seq_group need to be swap_in or swap_out, call the _swap_in or _swap_out function
+class Scheduler:
+    def _swap_in(
+        self,
+        seq_group: SequenceGroup,
+        blocks_to_swap_in: Dict[int, int],
+    ) -> None:
+        mapping = self.block_manager.swap_in(seq_group)
+        blocks_to_swap_in.update(mapping)
+        for seq in seq_group.get_seqs(status=SequenceStatus.SWAPPED):
+            seq.status = SequenceStatus.RUNNING
+    
+    def _swap_out(
+        self,
+        seq_group: SequenceGroup,
+        blocks_to_swap_out: Dict[int, int],
+    ) -> None:
+        if not self.block_manager.can_swap_out(seq_group):
+            # FIXME(woosuk): Abort the sequence group instead of aborting the
+            # entire engine.
+            raise RuntimeError(
+                "Aborted due to the lack of CPU swap space. Please increase "
+                "the swap space to avoid this error.")
+        mapping = self.block_manager.swap_out(seq_group)
+        blocks_to_swap_out.update(mapping)
+        for seq in seq_group.get_seqs(status=SequenceStatus.RUNNING):
+            seq.status = SequenceStatus.SWAPPED
+
+    def _schedule(self) -> SchedulerOutputs:
+        # ... ...
+
+        # the blocks_to_swap_in and blocks_to_swap_out will send to the function step in scheduler
+        scheduler_outputs = SchedulerOutputs(
+            scheduled_seq_groups=self.running,
+            prompt_run=False,
+            num_batched_tokens=num_batched_tokens,
+            blocks_to_swap_in=blocks_to_swap_in,
+            blocks_to_swap_out=blocks_to_swap_out,
+            blocks_to_copy=blocks_to_copy,
+            ignored_seq_groups=[],
+        )
+        return scheduler_outputs
+
+# in vllm/core/block_manager.py, get a blocktable between the cpu_block and gpu_block.
+# allocate gpu_block for swap_in
+# allocate cpu_block for swap_out
+# not do the data exchange
 class BlockSpaceManager:
 
     def can_swap_in(self, seq_group: SequenceGroup) -> bool:
@@ -750,7 +797,7 @@ class BlockSpaceManager:
                     cpu_block = mapping[gpu_block]
                     cpu_block.ref_count += 1
                 else:
-                    # try to allocate a new cpu block
+                    # try to allocate a new cpu block, call CacheEngine
                     cpu_block = self.cpu_allocator.allocate()
                     mapping[gpu_block] = cpu_block
                 new_block_table.append(cpu_block)
@@ -763,6 +810,87 @@ class BlockSpaceManager:
             for gpu_block, cpu_block in mapping.items()
         }
         return block_number_mapping
+
+# then the blocktable : {cpu_block, gpu_block} or {gpu_block, cpu_block} will be sent to cache_engine
+# and to exchange the data (swap_in, swap_out, copy)
+# through execute_model call the CacheEngine::swap_in, CacheEngine::swap_out
+# vllm/worker/worker.py
+class Worker:
+    def execute_model(
+        self,
+        seq_group_metadata_list: Optional[List[SequenceGroupMetadata]] = None,
+        blocks_to_swap_in: Optional[Dict[int, int]] = None,
+        blocks_to_swap_out: Optional[Dict[int, int]] = None,
+        blocks_to_copy: Optional[Dict[int, List[int]]] = None,
+    ) -> Optional[SamplerOutput]:
+        # ... ...
+        self.cache_swap(blocks_to_swap_in, blocks_to_swap_out, blocks_to_copy)
+
+        # If there is no input, we don't need to execute the model.
+        if num_seq_groups == 0:
+            return {}
+
+        output = self.model_runner.execute_model(seq_group_metadata_list,
+                                                 self.gpu_cache)
+        return output
+
+    def cache_swap(
+        self,
+        blocks_to_swap_in: Dict[int, int],
+        blocks_to_swap_out: Dict[int, int],
+        blocks_to_copy: Dict[int, List[int]],
+    ) -> None:
+        # Issue cache operations.
+        issued_cache_op = False
+        if blocks_to_swap_in:
+            self.cache_engine.swap_in(blocks_to_swap_in)
+            issued_cache_op = True
+        if blocks_to_swap_out:
+            self.cache_engine.swap_out(blocks_to_swap_out)
+            issued_cache_op = True
+        if blocks_to_copy:
+            self.cache_engine.copy(blocks_to_copy)
+            issued_cache_op = True
+
+# vllm/worker/cache_engine.py: Here do the data exchange between gpu_blocks and cpu_blocks
+class CacheEngine:
+    """Manages the KV cache.
+
+    This class is responsible for initializing and managing the GPU and CPU KV
+    caches. It also provides methods for performing KV cache operations, such
+    as swapping and copying.
+    """
+    # exchange the data
+    def _swap(
+        self,
+        src: List[KVCache],
+        dst: List[KVCache],
+        src_to_dst: Dict[int, int],
+    ) -> None:
+        with torch.cuda.stream(self.cache_stream):
+            # exchange the K-V blocks
+            for i in range(self.num_layers):
+                src_key_cache, src_value_cache = src[i]
+                dst_key_cache, dst_value_cache = dst[i]
+                # Copy the key blocks.
+                cache_ops.swap_blocks(src_key_cache, dst_key_cache, src_to_dst)
+                # Copy the value blocks.
+                cache_ops.swap_blocks(src_value_cache, dst_value_cache,
+                                      src_to_dst)
+                event = self.events[i]
+                event.record(stream=self.cache_stream)
+
+    def swap_in(self, src_to_dst: Dict[int, int]) -> None:
+        self._swap(self.cpu_cache, self.gpu_cache, src_to_dst)
+
+    def swap_out(self, src_to_dst: Dict[int, int]) -> None:
+        self._swap(self.gpu_cache, self.cpu_cache, src_to_dst)
+
+    def copy(self, src_to_dsts: Dict[int, List[int]]) -> None:
+        key_caches = [key_cache for key_cache, _ in self.gpu_cache]
+        value_caches = [value_cache for _, value_cache in self.gpu_cache]
+        # NOTE(woosuk): This operation implicitly synchronizes the CPU and GPU.
+        cache_ops.copy_blocks(key_caches, value_caches, src_to_dsts)
 
 ```
 
